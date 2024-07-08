@@ -1,5 +1,5 @@
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union, Tuple
 
 from fmeval.constants import (
     DatasetColumns,
@@ -32,9 +32,10 @@ RAW_VERDICTS = "raw_verdicts"
 STATEMENTS = "statements"
 RAW_STATEMENTS = "raw_statements"
 LONG_FORM_PROMPT = "long_form_prompt"
-NLI_STATEMENTS_PROMT = "nli_statements_prompt"
+NLI_STATEMENTS_PROMPT = "nli_statements_prompt"
 QUESTION = "question"
 ANSWER = "answer"
+
 
 LONG_FORM_ANSWER_PROMPT = """\
 Human: You are given a question and its answer. Your task is to rewrite the answer into one or more simple and coherent statements. Make sure that each statement is faithful to the answer and begins with "Statement:".
@@ -111,24 +112,27 @@ class FaithfulnessScore(Transform):
         """
         verdict_output = record[RAW_VERDICTS]
         statements = record[STATEMENTS]
-        record[self.output_key] = self._get_score(verdict_output, statements)
+        record[self.output_key], error = self._get_score(verdict_output, statements)
+        if error:
+            record[DatasetColumns.ERROR.value.name] = error
         return record
 
     @staticmethod
-    def _get_score(verdict_output: str, statements: str) -> float:
+    def _get_score(verdict_output: str, statements: str) -> Tuple[Optional[float], Optional[str]]:
         """Given generated statements and verdicts, compute Faithfulness score.
 
         :param verdict_output: Verdicts(Yes/No) and explanations string get from Judge model.
         :param statements: Statements string get from `GetStatements` Transform.
-        :returns: 0 to 1. See the docstring for `Faithfulness` for more details
-            on what these numerical values represent.
+        :returns: a tuple of (score, error). Score can range from 0 to 1. See the docstring for `Faithfulness`
+            for more details on what these numerical values represent.
         """
         output = verdict_output.lower().strip()
-        num_statements = len(statements.split("\n"))
-        # TODO: handle edge case that num_statements is 0
-
-        score = float(max(0, output.count("verdict: yes")) / num_statements)
-        return score
+        if statements != "":
+            num_statements = len(statements.split("\n"))
+            score = float(max(0, output.count("verdict: yes")) / num_statements)
+            return score, None
+        else:
+            return None, "No statements were generated from the answer."
 
 
 class GetStatements(Transform):
@@ -206,7 +210,7 @@ class Faithfulness(EvalAlgorithmInterface):
         )
         gen_nli_statements_prompt = GeneratePrompt(
             input_keys=[],
-            output_keys=[NLI_STATEMENTS_PROMT],
+            output_keys=[NLI_STATEMENTS_PROMPT],
             prompt_template=nli_statements_prompt_template,
             placeholder_to_record_key={
                 "context": DatasetColumns.TARGET_CONTEXT.value.name,
@@ -216,7 +220,7 @@ class Faithfulness(EvalAlgorithmInterface):
             },
         )
         get_raw_verdicts = GetModelOutputs(
-            input_to_output_keys={NLI_STATEMENTS_PROMT: [RAW_VERDICTS]},
+            input_to_output_keys={NLI_STATEMENTS_PROMPT: [RAW_VERDICTS]},
             model_runner=judge_model,
         )
         compute_score = FaithfulnessScore()
@@ -256,12 +260,16 @@ class Faithfulness(EvalAlgorithmInterface):
             nli_statements_prompt_template=nli_statements_prompt_template,
         )
         result = pipeline.execute_record(sample)
+        if DatasetColumns.ERROR.value.name in result:
+            return [
+                EvalScore(name=FAITHFULNESS, value=result[FAITHFULNESS], error=result[DatasetColumns.ERROR.value.name])
+            ]
         return [EvalScore(name=FAITHFULNESS, value=result[FAITHFULNESS])]
 
     def evaluate(
         self,
         judge_model: ModelRunner,
-        dataset_config: Optional[DataConfig] = None,
+        dataset_config: Optional[Union[DataConfig, List[DataConfig]]] = None,
         num_records: int = 100,
         save: bool = False,
         save_strategy: Optional[SaveStrategy] = None,
@@ -271,8 +279,9 @@ class Faithfulness(EvalAlgorithmInterface):
         """Compute the faithfulness score on one or more datasets.
 
         :param judge_model: An instance of ModelRunner representing the judge model to be used.
-        :param dataset_config: Configures the single dataset used for evaluation.
-            If not provided, evaluations will be run on all of this algorithm's built-in datasets.
+        :param dataset_config: Configures a single dataset or list of datasets used for the
+            evaluation. If not provided, this method will run evaluations using all of its
+            supported built-in datasets.
         :param num_records: The number of records to be sampled randomly from the input dataset(s)
             used to perform the evaluation(s).
         :param save: If set to true, prompt responses and scores will be saved to a file.
